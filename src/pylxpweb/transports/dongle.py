@@ -175,6 +175,10 @@ class _DongleFrameError(TransportReadError):
     """A stream-framing failure that makes the current socket unusable."""
 
 
+class _DongleEOFError(_DongleFrameError):
+    """The peer closed the stream before a complete response arrived."""
+
+
 class DongleTransport(RegisterDataMixin, BaseTransport):
     """WiFi Dongle TCP transport for local inverter communication.
 
@@ -294,6 +298,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         self._write_step_delay = write_step_delay
         self._verify_writes = verify_writes
         self._link_probe_active = False
+        self._link_probe_tls = False
         self._transaction_id = 0
         self._shutdown_requested = False
 
@@ -633,9 +638,8 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         ssl_ctx.verify_mode = ssl.CERT_NONE
         # PSK client callbacks only apply to TLS <= 1.2 (CPython docs), so a
         # TLS 1.3 negotiation would bypass the PSK entirely — cap it.
+        ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
         ssl_ctx.maximum_version = ssl.TLSVersion.TLSv1_2
-        ssl_ctx.options |= ssl.OP_NO_TLSv1
-        ssl_ctx.options |= ssl.OP_NO_TLSv1_1
         ssl_ctx.set_psk_client_callback(get_psk)
         ssl_ctx.set_ciphers("DHE-PSK-AES128-GCM-SHA256")
 
@@ -644,12 +648,12 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
     def _auto_ssl_context(self) -> ssl.SSLContext | None:
         """Return a probe context unless AUTO has a cached negative verdict."""
         if self._ssl_mode is None:
-            if self._link_probe_active and not self._ssl_proven:
+            if self._link_probe_active and not self._ssl_proven and not self._link_probe_tls:
                 # The cheap link-down probe (check_link) runs on a ~5s
                 # budget: never spend it TLS-probing an undetermined
-                # channel.  Reuse the last-known state — plaintext until
-                # TLS has proven — and let a real connect() resolve
-                # capability under its full budget.
+                # channel unless plaintext was immediately closed/reset.
+                # Silent plaintext peers still cost just one short read;
+                # ENC peers get one TLS attempt inside the same budget.
                 return None
             if (
                 self._ssl_unsupported_until is not None
@@ -745,14 +749,15 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         # session before dialing a new one (the dongle has ONE TCP slot).
         await channel.close()
 
-        for attempt in range(self._connection_retries):
+        connection_retries = 1 if self._link_probe_active else self._connection_retries
+        for attempt in range(connection_retries):
             self._raise_if_shutdown()
             try:
                 if attempt > 0:
                     _LOGGER.info(
                         "Connection retry %d/%d to %s:%s (waiting %.1fs)...",
                         attempt,
-                        self._connection_retries - 1,
+                        connection_retries - 1,
                         self._host,
                         self._port,
                         retry_delay,
@@ -863,7 +868,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                         self._port,
                         err,
                         attempt + 1,
-                        self._connection_retries,
+                        connection_retries,
                     )
                 else:
                     _LOGGER.warning(
@@ -872,7 +877,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                         self._port,
                         err,
                         attempt + 1,
-                        self._connection_retries,
+                        connection_retries,
                     )
             except TimeoutError as err:
                 last_error = err
@@ -883,7 +888,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                     self._host,
                     self._port,
                     attempt + 1,
-                    self._connection_retries,
+                    connection_retries,
                 )
             except OSError as err:
                 last_error = err
@@ -895,7 +900,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                     self._port,
                     err,
                     attempt + 1,
-                    self._connection_retries,
+                    connection_retries,
                 )
             except BaseException:
                 # CancelledError (or any unexpected error) raised between
@@ -914,14 +919,14 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         if isinstance(last_error, TimeoutError):
             raise TransportConnectionError(
                 f"Timeout connecting to {self._host}:{self._port} after "
-                f"{self._connection_retries} attempts. "
+                f"{connection_retries} attempts. "
                 "Verify: (1) IP address is correct, (2) dongle is on network, "
                 "(3) port 8000 is not blocked by firmware."
             ) from last_error
         else:
             raise TransportConnectionError(
                 f"Failed to connect to {self._host}:{self._port} after "
-                f"{self._connection_retries} attempts: {last_error}. "
+                f"{connection_retries} attempts: {last_error}. "
                 "Verify: (1) IP address is correct, (2) dongle is accessible, "
                 "(3) no other client is connected (dongle allows only ONE connection)."
             ) from last_error
@@ -1191,7 +1196,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                 return
 
             if not self._receive_buffer and discarded == 0:
-                raise _DongleFrameError(
+                raise _DongleEOFError(
                     f"[{self._serial}] Empty response from dongle. This may indicate: "
                     "(1) Dongle firmware is blocking local Modbus access, "
                     "(2) Connection was closed by dongle, or "
@@ -1200,7 +1205,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                 )
 
             expected = f" of {expected_size} advertised bytes" if expected_size is not None else ""
-            raise _DongleFrameError(
+            raise _DongleEOFError(
                 f"[{self._serial}] Connection closed before complete frame: "
                 f"received {len(self._receive_buffer)} bytes{expected}"
             )
@@ -1335,7 +1340,8 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                 When provided, rejects responses for a different register range.
             expected_count: Expected number of registers.  When provided,
                 rejects a response carrying fewer registers than requested
-                (short read) so it retries and, on exhaustion, raises.
+                (short read) so it retries and, on exhaustion, raises. Larger
+                replies are trimmed to the requested range after validation.
             retry_on_timeout: Resend the request in-call after a response
                 timeout (the connection is torn down on every timeout
                 regardless of this flag).  Safe for idempotent requests
@@ -1614,6 +1620,8 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                 list — on the holding/parameter path that silently drops
                 registers from the parameter dict, skipping the #282 sticky
                 merge and blanking HA entities for the full cache TTL.
+                Larger responses are validated in full, then trimmed to
+                exactly this many registers.
 
         Returns:
             List of register values
@@ -1861,10 +1869,16 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                 f"got {len(registers)}"
             )
 
+        # ENC firmware can return a larger block at the requested address.
+        # Consume/validate the entire frame, but keep parameter reads inside
+        # the caller's requested range (e.g. 80 returned for a 40-register read).
+        if expected_count is not None:
+            return registers[:expected_count]
+
         return registers
 
     async def check_link(self) -> bool:
-        """Cheap link-down probe: one read, single attempt, short timeout.
+        """Probe the link with a short read and optional ENC TLS recovery.
 
         The production failure mode this bounds: the dongle accepts TCP but
         never answers (wedged firmware, blocked port 8000), so a normal read
@@ -1872,8 +1886,10 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
         coordinator refresh while the link is down — Home Assistant absorbs
         that into the effective poll interval (eg4_web_monitor#587).
 
-        The outer bound also caps the connect retry ladder for
-        connection-refused endpoints.  Any exception — including the outer
+        Each dial gets one attempt without connection backoff. Unknown AUTO
+        channels start in plaintext; a peer close/reset permits one TLS
+        attempt inside the same total budget. Silent peers do not trigger
+        TLS detection. Any exception — including the outer
         cancellation — reports the link as down; ``_send_receive`` already
         tears the connection down on response timeouts, and the explicit
         teardown after an outer cancellation guarantees the next probe
@@ -1917,19 +1933,44 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                     channel = self._resolve_channel()
                     started = True
                     try:
-                        # A probe dial must reuse the last-known channel state
-                        # instead of AUTO TLS-probing (see _auto_ssl_context):
-                        # a TLS-silent peer would otherwise burn the handshake
-                        # timeout inside this budget and report a working
-                        # plaintext dongle as down.
+                        # Try last-known state first. An unknown AUTO channel
+                        # starts in plaintext so silent peers stay cheap, but
+                        # an ENC peer's immediate close/reset permits one TLS
+                        # attempt under this same operation lock and budget.
                         self._link_probe_active = True
-                        await self._send_receive(
-                            packet,
-                            max_retries=0,
-                            expected_func=MODBUS_READ_INPUT,
-                            expected_register=0,
-                            timeout_override=LINK_PROBE_TIMEOUT_SECONDS,
-                        )
+                        try:
+                            await self._send_receive(
+                                packet,
+                                max_retries=0,
+                                expected_func=MODBUS_READ_INPUT,
+                                expected_register=0,
+                                timeout_override=LINK_PROBE_TIMEOUT_SECONDS,
+                            )
+                        except (TransportConnectionError, TransportReadError) as err:
+                            cause: BaseException | None = err
+                            while cause is not None and not isinstance(
+                                cause, (_DongleEOFError, ConnectionResetError)
+                            ):
+                                cause = cause.__cause__
+                            if (
+                                cause is None
+                                or self._ssl_mode is not None
+                                or channel.ssl_proven
+                                or (
+                                    channel.ssl_unsupported_until is not None
+                                    and time.monotonic() < channel.ssl_unsupported_until
+                                )
+                                or self._ssl_ctx() is None
+                            ):
+                                raise
+                            self._link_probe_tls = True
+                            await self._send_receive(
+                                packet,
+                                max_retries=0,
+                                expected_func=MODBUS_READ_INPUT,
+                                expected_register=0,
+                                timeout_override=LINK_PROBE_TIMEOUT_SECONDS,
+                            )
                     except asyncio.CancelledError:
                         if budget.expired():
                             # Budget hit mid-probe: whatever stream is
@@ -1944,6 +1985,7 @@ class DongleTransport(RegisterDataMixin, BaseTransport):
                         raise
                     finally:
                         self._link_probe_active = False
+                        self._link_probe_tls = False
         except TimeoutError:
             if started:
                 _LOGGER.debug("[%s] Link probe exceeded its budget", self._serial)
