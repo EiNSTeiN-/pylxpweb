@@ -59,8 +59,12 @@ The base URL is fully configurable to support regional variations and future end
   - The dongle serves the cloud and local clients at the same time but does not clearly
     separate which side requested what, so occasional *"Response mismatch"* debug messages
     are expected — the library detects a response meant for the cloud and retries.
-  - Dongles with encryption enabled (label **E-WIFI ENC**) do not work locally; if you
-    have one, ask Luxpower support to downgrade its firmware.
+  - Encrypted dongles (label **E-WIFI ENC**) use TLS 1.2 with a pre-shared key on
+    port 8000. `DongleTransport(..., use_ssl=True)` requires TLS; the default
+    `use_ssl=None` detects support. Credentials are derived automatically from the
+    10-character dongle serial, without a cloud login or dongle PIN. Local reads
+    have been verified on a BJ-series ENC dongle running V3.03; other firmware
+    versions and control operations need separate hardware validation.
 - **Modbus** — a direct Modbus connection to the inverter's RS-485 port, over TCP (an
   RS-485-to-Ethernet gateway) or serial (a USB adapter, or a serial URL such as
   `socket://`, `rfc2217://`, or `esphome://` for a network / ESPHome serial proxy).
@@ -85,6 +89,14 @@ The base URL is fully configurable to support regional variations and future end
 A local connection must have a **single client**: sharing the same dongle or RS-485 line
 between multiple applications (e.g. Home Assistant plus a script, or two Home Assistant
 instances) causes interleaved responses, data corruption, and intermittent errors.
+
+For an ENC dongle, a cold `check_link()` starts with a bounded plaintext probe and
+tries TLS if the peer immediately closes or resets that connection. Silent peers
+still cost one short plaintext probe. For a known ENC dongle, use `use_ssl=True`
+to negotiate TLS directly and prevent plaintext fallback. Python must be built
+with OpenSSL PSK support (`ssl.HAS_PSK`); TLS-PSK is not certificate authentication
+and does not establish trust against an active attacker (see the transport's
+security notes).
 
 
 ## Installation
